@@ -200,18 +200,30 @@ function parseSquirrelConfig(text) {
   const patch = validatePatchObject(doc, 'squirrel.custom.yaml');
   const style = patch.style || {};
   if (!isPlainObject(style)) throw new Error('squirrel.custom.yaml 的 patch.style 必须是对象。');
-  const schemes = patch.preset_color_schemes || {};
-  if (!isPlainObject(schemes)) {
+  const nestedSchemes = patch.preset_color_schemes || {};
+  if (!isPlainObject(nestedSchemes)) {
     throw new Error('squirrel.custom.yaml 的 patch.preset_color_schemes 必须是对象。');
   }
+  // 官方 wiki 亦支持扁平写法：preset_color_schemes/<id>、style/<key> 直接作为 patch 的键，
+  // 与小狼毫侧一致。同一皮肤两种写法并存时以扁平键为准。
+  const schemeEntries = new Map(
+    Object.entries(nestedSchemes).map(([id, scheme]) => [id, { scheme, flat: false }]),
+  );
+  for (const [key, value] of Object.entries(flatPatchEntries(patch, SCHEME_PATCH_PREFIX))) {
+    if (!isPlainObject(value)) {
+      throw new Error(`squirrel.custom.yaml 的 patch["${SCHEME_PATCH_PREFIX}${key}"] 必须是对象。`);
+    }
+    schemeEntries.set(key, { scheme: value, flat: true });
+  }
+  const styleLike = { ...style, ...flatPatchEntries(patch, STYLE_PATCH_PREFIX) };
   const globalLayout = {
-    ...layoutFromStyle(style),
+    ...layoutFromStyle(styleLike),
     ...layoutFromMenuPatch(patch),
   };
-  const skins = Object.entries(schemes).map(([id, scheme]) =>
+  const skins = [...schemeEntries.entries()].map(([id, { scheme, flat }]) =>
     skinFromScheme('squirrel', id, scheme, globalLayout, {
       file: 'squirrel.custom.yaml',
-      path: `patch.preset_color_schemes.${id}`,
+      path: flat ? `patch["${SCHEME_PATCH_PREFIX}${id}"]` : `patch.preset_color_schemes.${id}`,
     }),
   );
 
@@ -219,8 +231,8 @@ function parseSquirrelConfig(text) {
     platform: 'squirrel',
     document: doc,
     skins,
-    activeSkinId: style.color_scheme || '',
-    darkSkinId: style.color_scheme_dark || '',
+    activeSkinId: patch['style/color_scheme'] || style.color_scheme || '',
+    darkSkinId: patch['style/color_scheme_dark'] || style.color_scheme_dark || '',
   };
 }
 
@@ -334,8 +346,51 @@ function validatePatchObject(doc, filename) {
   return patch;
 }
 
+// 扁平补丁键（patch 一级的 "前缀/键名" 形式）公共支持。
+const SCHEME_PATCH_PREFIX = 'preset_color_schemes/';
+const STYLE_PATCH_PREFIX = 'style/';
+
+function flatPatchEntries(patch, prefix) {
+  const result = {};
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (
+      typeof key === 'string'
+      && key.startsWith(prefix)
+      && key.length > prefix.length
+      && !key.slice(prefix.length).includes('/')
+    ) {
+      result[key.slice(prefix.length)] = value;
+    }
+  }
+  return result;
+}
+
+// style 字段是否只以扁平键（style/xxx）存在：patch 里没有嵌套 style 对象时才算。
+// 两种写法并存（如旧版本转换产生的混合文件）时以嵌套对象为准，保持既有行为。
+function squirrelStyleIsFlat(patch) {
+  const hasFlatStyleKey = Object.keys(flatPatchEntries(patch, STYLE_PATCH_PREFIX)).length > 0;
+  return hasFlatStyleKey && !isPlainObject(patch.style);
+}
+
+// 决定皮肤写入位置：皮肤原本在哪就写回哪；新建或来自内置配色的皮肤跟随文件的主流写法。
+function squirrelSchemeWritePath(patch, skin) {
+  const id = String(skin?.id || '').trim();
+  const sourcePath = skin?.source?.file === 'squirrel.custom.yaml' ? String(skin.source.path || '') : '';
+  if (sourcePath === `patch["${SCHEME_PATCH_PREFIX}${id}"]`) {
+    return ['patch', `${SCHEME_PATCH_PREFIX}${id}`];
+  }
+  if (sourcePath === `patch.preset_color_schemes.${id}`) {
+    return ['patch', 'preset_color_schemes', id];
+  }
+  if (!isPlainObject(patch.preset_color_schemes)
+    && Object.keys(flatPatchEntries(patch, SCHEME_PATCH_PREFIX)).length) {
+    return ['patch', `${SCHEME_PATCH_PREFIX}${id}`];
+  }
+  return ['patch', 'preset_color_schemes', id];
+}
+
 function updateSquirrelConfig(text, skin, options = {}) {
-  validatePatchObject(parseYaml(text || ''), 'squirrel.custom.yaml');
+  const patch = validatePatchObject(parseYaml(text || ''), 'squirrel.custom.yaml');
   const schemePatch = schemeFromSkin(skin, 'squirrel');
   const stylePatch = {
     ...styleFromSkin(skin, 'squirrel'),
@@ -343,13 +398,23 @@ function updateSquirrelConfig(text, skin, options = {}) {
     ...(options.makeDark ? { color_scheme_dark: skin.id } : {}),
   };
   let output = ensurePatchText(text || 'patch:\n');
-  output = upsertObjectFields(output, ['patch', 'preset_color_schemes', skin.id], schemePatch);
-  output = upsertObjectFields(output, ['patch', 'style'], stylePatch);
+  const schemePath = squirrelSchemeWritePath(patch, skin);
+  output = upsertObjectFields(output, schemePath, schemePatch);
+  if (squirrelStyleIsFlat(patch)) {
+    for (const [key, value] of Object.entries(stylePatch)) {
+      output = isPlainObject(value)
+        ? upsertObjectFields(output, ['patch', `${STYLE_PATCH_PREFIX}${key}`], value)
+        : upsertNestedBlock(output, ['patch', `${STYLE_PATCH_PREFIX}${key}`], value);
+    }
+  } else {
+    output = upsertObjectFields(output, ['patch', 'style'], stylePatch);
+  }
   if (schemePatch.candidate_list_layout !== undefined) {
-    output = removeNestedBlock(output, ['patch', 'preset_color_schemes', skin.id, 'horizontal']);
+    output = removeNestedBlock(output, [...schemePath, 'horizontal']);
   }
   if (stylePatch.candidate_list_layout !== undefined) {
     output = removeNestedBlock(output, ['patch', 'style', 'horizontal']);
+    output = removeNestedBlock(output, ['patch', `${STYLE_PATCH_PREFIX}horizontal`]);
   }
   if (Object.prototype.hasOwnProperty.call(options, 'alternativeSelectLabels')) {
     output = updateGlobalCustomConfig(output, {
@@ -364,7 +429,17 @@ function updateActiveSkinConfig(text, platform, skinId, options = {}) {
   if (!id) throw new Error('缺少当前皮肤 ID。');
   const output = ensurePatchText(text || 'patch:\n');
   if (platform === 'squirrel') {
-    validatePatchObject(parseYaml(output), 'squirrel.custom.yaml');
+    const patch = validatePatchObject(parseYaml(output), 'squirrel.custom.yaml');
+    if (squirrelStyleIsFlat(patch)) {
+      let updated = upsertNestedValue(output, ['patch', `${STYLE_PATCH_PREFIX}color_scheme`], id);
+      if (options.makeDark) {
+        updated = upsertNestedValue(updated, ['patch', `${STYLE_PATCH_PREFIX}color_scheme_dark`], id);
+      }
+      if (options.clearDark) {
+        updated = removeNestedValue(updated, ['patch', `${STYLE_PATCH_PREFIX}color_scheme_dark`]);
+      }
+      return ensureTrailingNewline(updated);
+    }
     let updated = upsertObjectFields(output, ['patch', 'style'], {
       color_scheme: id,
       ...(options.makeDark ? { color_scheme_dark: id } : {}),
@@ -399,9 +474,13 @@ function updateWeaselConfig(text, skin, options = {}) {
 
 function deleteSquirrelSkinConfig(text, skinId) {
   validatePatchObject(parseYaml(text || ''), 'squirrel.custom.yaml');
+  // 嵌套与扁平两种位置都尝试清理，删不存在的位置是空操作。
   let output = removeNestedBlock(text, ['patch', 'preset_color_schemes', skinId]);
+  output = removeNestedBlock(output, ['patch', `${SCHEME_PATCH_PREFIX}${skinId}`]);
   output = removeNestedValue(output, ['patch', 'style', 'color_scheme'], skinId);
+  output = removeNestedValue(output, ['patch', `${STYLE_PATCH_PREFIX}color_scheme`], skinId);
   output = removeNestedValue(output, ['patch', 'style', 'color_scheme_dark'], skinId);
+  output = removeNestedValue(output, ['patch', `${STYLE_PATCH_PREFIX}color_scheme_dark`], skinId);
   return ensureTrailingNewline(output);
 }
 
